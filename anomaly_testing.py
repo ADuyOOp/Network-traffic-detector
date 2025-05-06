@@ -1,216 +1,45 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-import threading
-import time
-import queue
-from datetime import datetime
-import logging
-from scapy.all import sniff, IP, TCP, UDP, ICMP
-import platform
-import socket
-import psycopg2
-from psycopg2 import sql
-from psycopg2.extras import execute_batch
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import time
+import os
+from datetime import datetime
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Configure page
+st.set_page_config(page_title="Network Traffic Anomaly Detection", layout="wide")
+st.title("Network Traffic Anomaly Detection")
 
-# Database Configuration
-DB_CONFIG = {
-    'dbname': 'network_traffic',
-    'user': 'postgres',
-    'password': '123456',
-    'host': 'localhost',
-    'port': '5432'
-}
+# Function to load data from CSV
+def load_data(file_path):
+    try:
+        # Check if file_path is a string (path) or a file-like object (from uploader)
+        if isinstance(file_path, str):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_csv(file_path)
 
-class DatabaseManager:
-    """Handles all database operations"""
-
-    def __init__(self):
-        self.conn = None
-        self.connect()
-        self.create_table()
-
-    def connect(self):
-        """Establish database connection"""
-        try:
-            self.conn = psycopg2.connect(**DB_CONFIG)
-            logger.info("Connected to PostgreSQL database")
-        except Exception as e:
-            logger.error(f"Database connection error: {str(e)}")
-            raise
-
-    def create_table(self):
-        """Create the packets table if it doesn't exist"""
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS packets (
-            id SERIAL PRIMARY KEY,
-            timestamp TIMESTAMP,
-            source_ip VARCHAR(45),
-            source_domain VARCHAR(255),
-            destination_ip VARCHAR(45),
-            destination_domain VARCHAR(255),
-            protocol VARCHAR(10),
-            size INTEGER,
-            src_port INTEGER,
-            dst_port INTEGER,
-            tcp_flags VARCHAR(10),
-            time_relative FLOAT
-        );
-        """
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(create_table_query)
-                self.conn.commit()
-        except Exception as e:
-            logger.error(f"Error creating table: {str(e)}")
-            self.conn.rollback()
-            raise
-
-    def insert_packet(self, packet_info):
-        """Insert a single packet into the database"""
-        insert_query = """
-        INSERT INTO packets (
-            timestamp, source_ip, source_domain, destination_ip, destination_domain,
-            protocol, size, src_port, dst_port, tcp_flags, time_relative
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(insert_query, (
-                    packet_info['timestamp'],
-                    packet_info['source'],
-                    packet_info['source_domain'],
-                    packet_info['destination'],
-                    packet_info['destination_domain'],
-                    packet_info['protocol'],
-                    packet_info['size'],
-                    packet_info.get('src_port'),
-                    packet_info.get('dst_port'),
-                    packet_info.get('tcp_flags'),
-                    packet_info['time_relative']
-                ))
-                self.conn.commit()
-        except Exception as e:
-            logger.error(f"Error inserting packet: {str(e)}")
-            self.conn.rollback()
-            raise
-
-    def close(self):
-        """Close the database connection"""
-        if self.conn:
-            self.conn.close()
-            logger.info("Database connection closed")
-
-class PacketProcessor:
-    """Process and analyze network packets"""
-
-    def __init__(self, db_manager):
-        self.protocol_map = {1: "ICMP", 6: "TCP", 17: "UDP"}
-        self.packet_data = queue.Queue(maxsize=10000)
-        self.start_time = datetime.now()
-        self.lock = threading.Lock()
-        self.db_manager = db_manager
-
-    def get_protocol_name(self, protocol_num: int) -> str:
-        """Convert protocol number to readable protocol name"""
-        return self.protocol_map.get(protocol_num, f"OTHER({protocol_num})")
-
-    def resolve_ip_to_domain(self, ip_address: str) -> str:
-        """Resolve an IP address to a domain name (if possible)"""
-        try:
-            domain = socket.gethostbyaddr(ip_address)[0]
-            return domain
-        except (socket.herror, socket.gaierror):
-            return ip_address
-
-    def process_packet(self, packet) -> None:
-        """Process an incoming network packet and extract relevant details"""
-        try:
-            if IP in packet:
-                source_domain = self.resolve_ip_to_domain(packet[IP].src)
-                destination_domain = self.resolve_ip_to_domain(packet[IP].dst)
-
-                packet_info = {
-                    "timestamp": datetime.now(),
-                    "source": packet[IP].src,
-                    "source_domain": source_domain,
-                    "destination": packet[IP].dst,
-                    "destination_domain": destination_domain,
-                    "protocol": self.get_protocol_name(packet[IP].proto),
-                    "size": len(packet),
-                    "time_relative": (datetime.now() - self.start_time).total_seconds(),
-                }
-
-                if TCP in packet:
-                    packet_info.update({
-                        "src_port": packet[TCP].sport,
-                        "dst_port": packet[TCP].dport,
-                        "tcp_flags": str(packet[TCP].flags)
-                    })
-                elif UDP in packet:
-                    packet_info.update({
-                        "src_port": packet[UDP].sport,
-                        "dst_port": packet[UDP].dport
-                    })
-                elif ICMP in packet:
-                    packet_info.update({
-                        "src_port": 0,  # ICMP doesn't use ports, but we need values for anomaly detection
-                        "dst_port": 0,
-                        "icmp_type": packet[ICMP].type,
-                        "icmp_code": packet[ICMP].code
-                    })
-
-                # Store in database
-                self.db_manager.insert_packet(packet_info)
-
-                # Also add to queue for real-time display
-                if self.packet_data.full():
-                    self.packet_data.get()
-                self.packet_data.put(packet_info)
-
-                logger.info(f"Captured and stored packet: {packet_info}")
-
-        except Exception as e:
-            logger.error(f"Error processing packet: {str(e)}")
-
-    def get_dataframe(self) -> pd.DataFrame:
-        """Convert packet data queue to a pandas DataFrame"""
-        with self.lock:
-            return pd.DataFrame(list(self.packet_data.queue))
-
-def start_packet_capture(db_manager):
-    """Start real-time packet capture in a separate thread"""
-    processor = PacketProcessor(db_manager)
-
-    def capture_packets():
-        try:
-            interface = "Wi-Fi" if "Windows" in str(platform.system()) else "wlan0"
-            logger.info(f"Starting packet capture on interface: {interface}")
-            sniff(prn=processor.process_packet, store=False, iface=interface)
-        except Exception as e:
-            logger.error(f"Failed to start packet capture: {str(e)}")
-
-    capture_thread = threading.Thread(target=capture_packets, daemon=True)
-    capture_thread.start()
-    return processor
+        # Convert timestamp to datetime if it exists
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return None
 
 # Function to preprocess data for anomaly detection
 def preprocess_data(df):
-    """Preprocess data for anomaly detection"""
     # Select numerical features for anomaly detection
     numerical_features = ['size', 'src_port', 'dst_port', 'time_relative']
 
-    # Create a copy of the dataframe with only numerical features that exist
-    available_features = [f for f in numerical_features if f in df.columns]
-    df_numerical = df[available_features].copy()
+    # Create a copy of the dataframe with only numerical features
+    df_numerical = df[numerical_features].copy()
 
     # Handle missing values
     df_numerical = df_numerical.fillna(0)
@@ -224,11 +53,6 @@ def preprocess_data(df):
 
 # Function to detect anomalies using Isolation Forest
 def detect_anomalies(df_numerical, contamination=0.05):
-    """Detect anomalies in network traffic data"""
-    # Check if we have enough data
-    if len(df_numerical) < 10:  # Need at least 10 samples for meaningful anomaly detection
-        return None, None, None
-
     # Scale the features
     scaler = StandardScaler()
     df_scaled = scaler.fit_transform(df_numerical)
@@ -248,7 +72,6 @@ def detect_anomalies(df_numerical, contamination=0.05):
 
 # Function to explain why a packet is anomalous
 def explain_anomalies(df, df_with_anomalies, scaler, model):
-    """Generate explanations for why packets are flagged as anomalies"""
     # Combine original dataframe with anomaly results
     df_result = df.copy()
     df_result['anomaly'] = df_with_anomalies['anomaly']
@@ -414,16 +237,18 @@ def explain_anomalies(df, df_with_anomalies, scaler, model):
 
 # Function to display anomalies with explanations
 def display_anomalies(df, df_with_anomalies, scaler, model):
-    """Display anomalies with explanations in the Streamlit UI"""
     # Combine original dataframe with anomaly results
     df_result = df.copy()
     df_result['anomaly'] = df_with_anomalies['anomaly']
+
+    # Create visualizations
+    st.subheader("Anomaly Detection Results")
 
     # Display metrics
     col1, col2 = st.columns(2)
     with col1:
         total_packets = len(df_result)
-        st.metric("Total Packets Analyzed", total_packets)
+        st.metric("Total Packets", total_packets)
     with col2:
         anomaly_count = df_result['anomaly'].sum()
         st.metric("Anomalies Detected", f"{anomaly_count} ({(anomaly_count/total_packets)*100:.2f}%)")
@@ -435,6 +260,14 @@ def display_anomalies(df, df_with_anomalies, scaler, model):
     st.subheader("Anomalous Packets with Explanations")
 
     if len(anomalies_with_explanations) > 0:
+        # Select columns to display
+        display_columns = [
+            "timestamp", "source", "destination", "protocol",
+            "size", "src_port", "dst_port", "explanation"
+        ]
+        # Filter to only include columns that exist in the dataframe
+        display_columns = [col for col in display_columns if col in anomalies_with_explanations.columns]
+
         # Display each anomaly with its explanation
         for i, (idx, row) in enumerate(anomalies_with_explanations.iterrows()):
             with st.expander(f"Anomaly #{i+1} - {row['timestamp'] if 'timestamp' in row else 'Unknown time'} - {row['protocol'] if 'protocol' in row else 'Unknown protocol'}"):
@@ -485,135 +318,153 @@ def display_anomalies(df, df_with_anomalies, scaler, model):
                     if 'suspicious' in row['explanation'].lower() and 'port' in row['explanation'].lower():
                         st.markdown("- Suspicious ports may indicate communication with command and control servers")
     else:
-        st.info("No anomalies detected in the current network traffic.")
+        st.info("No anomalies detected in the dataset.")
 
-def create_visualizations(df: pd.DataFrame):
-    """Generate data visualizations"""
-    if len(df) > 0:
-        df = df.copy()
-
-        # Protocol distribution
-        protocol_counts = df["protocol"].value_counts()
-        fig_protocol = px.pie(
-            values=protocol_counts.values, names=protocol_counts.index,
-            title="Protocol Distribution"
-        )
-        st.plotly_chart(fig_protocol, use_container_width=True)
-
-        # Packets timeline
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df_grouped = df.groupby(df["timestamp"].dt.floor("s")).size()
-        fig_timeline = px.line(
-            x=df_grouped.index, y=df_grouped.values,
-            title="Packets per Second"
-        )
-        st.plotly_chart(fig_timeline, use_container_width=True)
-
-        # Top source IPs
-        top_sources = df["source"].value_counts().head(10)
-        fig_sources = px.bar(
-            x=top_sources.index, y=top_sources.values,
-            title="Top Source IP Addresses"
-        )
-        st.plotly_chart(fig_sources, use_container_width=True)
-
+# Main function
 def main():
-    """Main Streamlit Dashboard"""
-    st.set_page_config(page_title="Network Traffic Analysis", layout="wide")
-    st.title("Real-time Network Traffic Analysis")
-
-    # Initialize database manager
-    if "db_manager" not in st.session_state:
-        st.session_state.db_manager = DatabaseManager()
-
-    # Initialize packet processor if not already in session state
-    if "processor" not in st.session_state:
-        st.session_state.processor = start_packet_capture(st.session_state.db_manager)
-        st.session_state.start_time = time.time()
-        st.session_state.all_packets = pd.DataFrame()
-        st.session_state.anomaly_detection_enabled = True
-        st.session_state.contamination = 0.05
-
     # Sidebar for configuration
     st.sidebar.title("Configuration")
 
-    # Anomaly detection settings
-    st.sidebar.subheader("Anomaly Detection")
-    st.session_state.anomaly_detection_enabled = st.sidebar.checkbox("Enable Anomaly Detection", value=st.session_state.anomaly_detection_enabled)
+    # Data source selection
+    st.sidebar.subheader("Data Source")
+    data_source = st.sidebar.radio(
+        "Select data source",
+        ["Upload CSV", "Use Sample Data"]
+    )
 
-    if st.session_state.anomaly_detection_enabled:
-        st.session_state.contamination = st.sidebar.slider(
-            "Contamination (expected proportion of anomalies)",
-            min_value=0.01,
-            max_value=0.2,
-            value=st.session_state.contamination,
-            step=0.01
-        )
+    # Initialize df as None
+    df = None
 
-    # Retrieve the latest captured data
-    new_packets = st.session_state.processor.get_dataframe()
-
-    # Append new packets to the existing data
-    if not new_packets.empty:
-        st.session_state.all_packets = pd.concat(
-            [st.session_state.all_packets, new_packets],
-            ignore_index=True
-        )
-
-    # Create tabs for different views
-    tab1, tab2 = st.tabs(["Dashboard", "Anomaly Detection"])
-
-    with tab1:
-        # Display metrics
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Packets", len(st.session_state.all_packets))
-        with col2:
-            duration = time.time() - st.session_state.start_time
-            st.metric("Capture Duration", f"{duration:.2f}s")
-
-        # Display visualizations
-        create_visualizations(st.session_state.all_packets)
-
-        # Show the most recent packets with scrollable table
-        st.subheader("Recent Packets")
-        if len(st.session_state.all_packets) > 0:
-            st.dataframe(
-                st.session_state.all_packets[
-                    ["timestamp", "source", "source_domain", "destination",
-                     "destination_domain", "protocol", "size"]
-                ],
-                use_container_width=True,
-                height=400
-            )
-
-    with tab2:
-        st.header("Network Traffic Anomaly Detection")
-
-        if not st.session_state.anomaly_detection_enabled:
-            st.warning("Anomaly detection is currently disabled. Enable it in the sidebar to detect unusual network traffic patterns.")
-        elif len(st.session_state.all_packets) < 10:
-            st.info("Collecting data... Need at least 10 packets for anomaly detection.")
-        else:
+    # Handle data source selection
+    if data_source == "Upload CSV":
+        uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
+        if uploaded_file is not None:
             try:
-                # Preprocess data for anomaly detection
-                df_numerical = preprocess_data(st.session_state.all_packets)
-
-                # Detect anomalies
-                df_with_anomalies, model, scaler = detect_anomalies(df_numerical, st.session_state.contamination)
-
-                if df_with_anomalies is not None:
-                    # Display anomalies with explanations
-                    display_anomalies(st.session_state.all_packets, df_with_anomalies, scaler, model)
-                else:
-                    st.info("Not enough data for meaningful anomaly detection yet.")
+                df = load_data(uploaded_file)
+                st.sidebar.success("File uploaded successfully!")
             except Exception as e:
-                st.error(f"Error in anomaly detection: {str(e)}")
-                st.exception(e)
+                st.sidebar.error(f"Error loading uploaded file: {str(e)}")
+    else:
+        # Use sample data
+        sample_file_path = "sample_network_data.csv"
 
-    # Automatic refresh every 5 seconds
-    time.sleep(5)
-    st.rerun()
+        # Check if the sample file exists
+        if not os.path.exists(sample_file_path):
+            st.error(f"Sample file {sample_file_path} not found. Please make sure the file exists in the current directory.")
+            return
+
+        st.sidebar.success(f"Using data from {sample_file_path}")
+
+        try:
+            df = load_data(sample_file_path)
+        except Exception as e:
+            st.sidebar.error(f"Error loading sample file: {str(e)}")
+
+    # Anomaly detection parameters
+    contamination = st.sidebar.slider(
+        "Contamination (expected proportion of anomalies)",
+        min_value=0.01,
+        max_value=0.5,
+        value=0.05,
+        step=0.01
+    )
+
+    # Process data if available
+    if df is None:
+        if data_source == "Upload CSV":
+            st.info("Please upload a CSV file to begin analysis.")
+
+            # Show expected CSV format
+            st.subheader("Expected CSV Format")
+            example_data = {
+                "timestamp": ["2023-01-01 12:00:00", "2023-01-01 12:00:01"],
+                "source": ["192.168.1.1", "192.168.1.2"],
+                "source_domain": ["device1.local", "device2.local"],
+                "destination": ["8.8.8.8", "1.1.1.1"],
+                "destination_domain": ["dns.google", "cloudflare-dns.com"],
+                "protocol": ["TCP", "UDP"],
+                "size": [64, 128],
+                "src_port": [12345, 54321],
+                "dst_port": [443, 53],
+                "tcp_flags": ["0x18", ""],
+                "time_relative": [0.0, 1.0]
+            }
+            st.dataframe(pd.DataFrame(example_data), use_container_width=True)
+        else:
+            st.error("Could not load the sample data file.")
+        return
+
+    # Continue with data processing
+    try:
+        # Display all raw data with filtering options
+        st.subheader("Complete Network Data")
+
+        # Add filtering options
+        with st.expander("Filter Data", expanded=False):
+            col1, col2 = st.columns(2)
+
+            # Protocol filter
+            with col1:
+                if 'protocol' in df.columns:
+                    protocols = ['All'] + sorted(df['protocol'].unique().tolist())
+                    selected_protocol = st.selectbox("Filter by Protocol", protocols)
+
+            # Source IP filter
+            with col2:
+                if 'source' in df.columns:
+                    sources = ['All'] + sorted(df['source'].unique().tolist())
+                    selected_source = st.selectbox("Filter by Source IP", sources)
+
+            # Search functionality
+            search_term = st.text_input("Search in any field", "")
+
+        # Apply filters
+        filtered_df = df.copy()
+
+        if 'protocol' in df.columns and selected_protocol != 'All':
+            filtered_df = filtered_df[filtered_df['protocol'] == selected_protocol]
+
+        if 'source' in df.columns and selected_source != 'All':
+            filtered_df = filtered_df[filtered_df['source'] == selected_source]
+
+        # Apply search across all string columns
+        if search_term:
+            mask = pd.Series(False, index=filtered_df.index)
+            for col in filtered_df.select_dtypes(include=['object']).columns:
+                mask = mask | filtered_df[col].astype(str).str.contains(search_term, case=False, na=False)
+            filtered_df = filtered_df[mask]
+
+        # Show the filtered data
+        st.dataframe(filtered_df, use_container_width=True, height=400)
+
+        # Show filter summary
+        st.caption(f"Showing {len(filtered_df)} of {len(df)} records")
+
+        # Display data statistics
+        st.subheader("Data Statistics")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Packets", len(df))
+        with col2:
+            if 'protocol' in df.columns:
+                protocols = df['protocol'].value_counts()
+                st.metric("Protocols", len(protocols))
+        with col3:
+            if 'source' in df.columns:
+                sources = df['source'].nunique()
+                st.metric("Unique Sources", sources)
+
+        # Preprocess data
+        df_numerical = preprocess_data(df)
+
+        # Detect anomalies
+        df_with_anomalies, model, scaler = detect_anomalies(df_numerical, contamination)
+
+        # Display anomalies with explanations
+        display_anomalies(df, df_with_anomalies, scaler, model)
+    except Exception as e:
+        st.error(f"Error processing data: {str(e)}")
+        st.exception(e)
 
 if __name__ == "__main__":
     main()
